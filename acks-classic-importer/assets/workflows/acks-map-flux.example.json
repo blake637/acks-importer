@@ -1,0 +1,15 @@
+{
+  "_comment": "Example CUSTOM Flux workflow override for the ACKS Classic Importer (API format). Paste into the module's 'ComfyUI workflow JSON' setting to override the built-in Flux builders. Supported placeholders: %%PROMPT%%, %%NEGATIVE%%, %%WIDTH%%, %%HEIGHT%%, %%SEED%%, %%CHECKPOINT%% (the Flux UNet filename), %%INIT_IMAGE%%. %%INIT_IMAGE%% receives the importer's labeled reference image (each area filled and captioned); feed it through VAEEncode for an img2img redraw so Flux repaints each labeled region in place. This example is a map (img2img) graph; for portraits, drop the LoadImage/ImageScale/VAEEncode chain and use an EmptyLatentImage instead. Built-in builders cover both already — use this only to customize.",
+  "1": { "class_type": "UNETLoader", "inputs": { "unet_name": "%%CHECKPOINT%%", "weight_dtype": "default" } },
+  "2": { "class_type": "DualCLIPLoader", "inputs": { "clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp16.safetensors", "type": "flux" } },
+  "3": { "class_type": "VAELoader", "inputs": { "vae_name": "ae.safetensors" } },
+  "4": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2", 0], "text": "%%PROMPT%%" } },
+  "5": { "class_type": "FluxGuidance", "inputs": { "conditioning": ["4", 0], "guidance": 3.5 } },
+  "6": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2", 0], "text": "" } },
+  "7": { "class_type": "LoadImage", "inputs": { "image": "%%INIT_IMAGE%%" } },
+  "8": { "class_type": "ImageScale", "inputs": { "image": ["7", 0], "width": "%%WIDTH%%", "height": "%%HEIGHT%%", "upscale_method": "lanczos", "crop": "disabled" } },
+  "9": { "class_type": "VAEEncode", "inputs": { "pixels": ["8", 0], "vae": ["3", 0] } },
+  "10": { "class_type": "KSampler", "inputs": { "model": ["1", 0], "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["9", 0], "seed": "%%SEED%%", "steps": 28, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.72 } },
+  "11": { "class_type": "VAEDecode", "inputs": { "samples": ["10", 0], "vae": ["3", 0] } },
+  "12": { "class_type": "SaveImage", "inputs": { "images": ["11", 0], "filename_prefix": "acks-importer-map" } }
+}

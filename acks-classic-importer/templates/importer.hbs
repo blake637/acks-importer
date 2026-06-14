@@ -1,0 +1,27 @@
+<div class="aci-app">
+  <div class="aci-dropzone">
+    <i class="fas fa-file-pdf"></i>
+    <p>Drop a classic module PDF here</p>
+    <p class="hint">Basic / AD&D 1e / AD&D 2e &rarr; ACKS world</p>
+    <label class="aci-browse">
+      or browse… <input type="file" accept="application/pdf" hidden />
+    </label>
+  </div>
+
+  <div class="aci-progress">
+    <div class="aci-bar"><div class="aci-fill" style="width: {{progress}}%"></div></div>
+    <p class="aci-message">{{message}}</p>
+  </div>
+
+  <div class="aci-toolbar">
+    <button type="button" class="aci-inspect"><i class="fas fa-magnifying-glass"></i> Inspect AI calls ({{aiCalls}})</button>
+    <button type="button" class="aci-export-log"><i class="fas fa-download"></i> Export call log</button>
+  </div>
+
+  <details class="aci-log" {{#if logLines.length}}open{{/if}}>
+    <summary>Pipeline log</summary>
+    <ol>
+      {{#each logLines}}<li>{{this}}</li>{{/each}}
+    </ol>
+  </details>
+</div>
