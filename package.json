@@ -1,0 +1,16 @@
+{
+  "name": "acks-classic-importer",
+  "version": "0.10.0",
+  "private": true,
+  "type": "module",
+  "description": "Foundry VTT module that imports classic & 5e adventure PDFs into ACKS worlds.",
+  "scripts": {
+    "test": "node test/run.js",
+    "test:e2e": "node test/e2e/run-e2e.js",
+    "test:e2e:selfcheck": "node test/e2e/selfcheck.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^1.0.0",
+    "pdfjs-dist": "^6.0.227"
+  }
+}

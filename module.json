@@ -1,0 +1,38 @@
+{
+  "id": "acks-classic-importer",
+  "title": "ACKS Classic Module Importer",
+  "description": "Imports classic TSR-era adventure PDFs (B/X, AD&D 1e, AD&D 2e) and generates a playable Foundry world for the Adventurer Conqueror King System: actors with tokens, scenes with walls/doors/lights, journals, and roll tables. Uses configurable LLM and image-generation APIs for extraction and asset creation.",
+  "version": "0.10.0",
+  "compatibility": {
+    "minimum": "11",
+    "verified": "13"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "acks",
+        "type": "system",
+        "compatibility": {}
+      }
+    ]
+  },
+  "authors": [
+    { "name": "Elpida" }
+  ],
+  "esmodules": ["scripts/main.js"],
+  "styles": ["styles/importer.css"],
+  "packs": [
+    {
+      "name": "imported-monsters",
+      "label": "Imported Monsters (ACKS)",
+      "path": "packs/imported-monsters",
+      "type": "Actor",
+      "system": "acks"
+    }
+  ],
+  "flags": {
+    "acks-classic-importer": {
+      "pipelineVersion": 1
+    }
+  }
+}

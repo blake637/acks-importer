@@ -1,0 +1,54 @@
+.aci-app { display: flex; flex-direction: column; gap: 10px; padding: 4px; }
+
+.aci-dropzone {
+  border: 2px dashed var(--color-border-light-primary, #999);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  transition: background 0.15s ease;
+}
+.aci-dropzone.hover { background: rgba(120, 80, 30, 0.15); border-color: #b07b34; }
+.aci-dropzone i { font-size: 36px; opacity: 0.7; }
+.aci-dropzone .hint { font-size: 0.85em; opacity: 0.7; }
+.aci-browse { cursor: pointer; text-decoration: underline; }
+
+.aci-bar {
+  height: 10px; border-radius: 5px;
+  background: rgba(0,0,0,0.25); overflow: hidden;
+}
+.aci-fill { height: 100%; background: #7a5a2a; transition: width 0.2s ease; }
+.aci-message { margin: 4px 0 0; font-size: 0.9em; min-height: 1.2em; }
+
+.aci-log ol { max-height: 180px; overflow-y: auto; font-size: 0.8em; margin: 4px 0; }
+
+.aci-toolbar { display: flex; gap: 6px; }
+.aci-toolbar button { flex: 1; font-size: 0.85em; }
+
+/* AI Call Inspector */
+.aci-inspector { max-height: 480px; overflow-y: auto; }
+.aci-inspector details.aci-call { border: 1px solid rgba(0,0,0,0.2); border-radius: 4px; margin: 3px 0; padding: 2px 6px; }
+.aci-inspector summary { display: flex; gap: 8px; align-items: baseline; cursor: pointer; font-size: 0.9em; }
+.aci-call-id { opacity: 0.6; min-width: 36px; }
+.aci-call-kind { font-variant: small-caps; min-width: 50px; }
+.aci-call-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aci-call-status { opacity: 0.8; }
+.aci-call.error summary .aci-call-status { color: #a22; font-weight: bold; }
+.aci-call.skipped summary .aci-call-status, .aci-call.aborted summary .aci-call-status { color: #a60; }
+.aci-call-body pre { max-height: 220px; overflow: auto; white-space: pre-wrap; font-size: 0.78em; background: rgba(0,0,0,0.06); padding: 4px; border-radius: 3px; }
+.aci-call-body pre.aci-error { color: #a22; }
+.aci-call-body h4 { margin: 6px 0 2px; }
+img.aci-thumb { border: 1px solid rgba(0,0,0,0.3); border-radius: 4px; max-width: 160px; }
+
+textarea.aci-fix { resize: vertical; }
+.aci-hint { background: rgba(180,120,30,0.15); border-left: 3px solid #b07b34; padding: 6px 10px; border-radius: 3px; font-size: 0.9em; }
+
+.acks-importer-launch { flex: 0; white-space: nowrap; }
+
+/* v13 ApplicationV2 sidebar: header buttons stack full-width */
+header.directory-header > .acks-importer-launch,
+.directory-header > .acks-importer-launch {
+  width: calc(100% - 8px);
+  margin: 2px 4px;
+}
+
+textarea.aci-review { resize: vertical; }
