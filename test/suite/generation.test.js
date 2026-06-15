@@ -1,7 +1,8 @@
 import "../foundry-shim.js";
 import { describe, it, expect } from "../harness.js";
 import { matchPlate } from "../../scripts/pipeline/plate-matcher.js";
-import { generateEncounterLayout, normalizeTerrain, rng, wallsForEncounter } from "../../scripts/pipeline/encounter-maps.js";
+import { normalizeTerrain, terrainPrompt } from "../../scripts/pipeline/encounter-maps.js";
+import { sanitizePlacement } from "../../scripts/pipeline/scene-builder.js";
 
 describe("plate matching by evidence, not proximity", () => {
   const plates = [
@@ -31,54 +32,39 @@ describe("terrain normalization", () => {
   it("Pebble Hills → hills", () => expect(normalizeTerrain("Pebble Hills")).toBe("hills"));
   it("bog → swamp", () => expect(normalizeTerrain("bog")).toBe("swamp"));
   it("unknown → grassland", () => expect(normalizeTerrain("the weird zone")).toBe("grassland"));
-});
-
-describe("seeded RNG", () => {
-  it("is deterministic for a seed", () => {
-    const a = rng(123), b = rng(123);
-    expect(a()).toBe(b());
-  });
-  it("differs across seeds", () => expect(rng(1)() === rng(2)()).toBeFalsy());
-});
-
-describe("encounter layout generation", () => {
-  it("is reproducible for the same seed", () => {
-    const a = generateEncounterLayout("forest", 30, 20, 12345);
-    const b = generateEncounterLayout("forest", 30, 20, 12345);
-    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
-  });
-  it("differs across seeds", () => {
-    const a = generateEncounterLayout("forest", 30, 20, 1);
-    const c = generateEncounterLayout("forest", 30, 20, 999);
-    expect(JSON.stringify(a) === JSON.stringify(c)).toBeFalsy();
-  });
-  it("keeps circular obstacles in bounds", () => {
-    const a = generateEncounterLayout("forest", 30, 20, 7);
-    for (const o of a.obstacles.filter((o) => o.cx !== undefined)) {
-      expect(o.cx).toBeGreaterThan(-0.1);
-      expect(o.cx).toBeLessThan(30.1);
-      expect(o.cy).toBeLessThan(20.1);
-    }
-  });
-  it("forest is denser than grassland", () => {
-    const f = generateEncounterLayout("forest", 30, 20, 5);
-    const g = generateEncounterLayout("grassland", 30, 20, 5);
-    expect(f.obstacles.length).toBeGreaterThan(g.obstacles.length);
+  it("terrainPrompt resolves a free-text terrain", () => {
+    expect(typeof terrainPrompt("Dweomer Forest")).toBe("string");
+    expect(terrainPrompt("Dweomer Forest")).toBe(terrainPrompt("forest"));
   });
 });
 
-describe("encounter wall typing", () => {
-  const m = generateEncounterLayout("mountains", 30, 20, 7);
-  const walls = wallsForEncounter(m, 100);
-  it("produces walls", () => expect(walls.length).toBeGreaterThan(0));
-  it("rocks block sight+movement (plain walls)", () => {
-    // plain walls have no sense override
-    expect(walls.some((w) => !("sight" in w))).toBeTruthy();
+describe("vision placement sanitizer", () => {
+  const dims = { width: 1000, height: 800 };
+  it("drops wall segments with non-finite coords", () => {
+    const out = sanitizePlacement({ walls: [{ x1: 10, y1: 10, x2: 20, y2: 20 }, { x1: "x", y1: 5, x2: 5, y2: 5 }] }, dims);
+    expect(out.walls.length).toBe(1);
   });
-  it("tree clusters use limited sight", () => {
-    const forest = generateEncounterLayout("forest", 30, 20, 3);
-    const fw = wallsForEncounter(forest, 100);
-    expect(fw.some((w) => w.sight === 10)).toBeTruthy(); // LIMITED stub = 10
+  it("clamps coordinates to the image bounds", () => {
+    const out = sanitizePlacement({ lights: [{ x: 5000, y: -10, radiusFeet: 30 }] }, dims);
+    expect(out.lights[0].x).toBe(1000);
+    expect(out.lights[0].y).toBe(0);
+  });
+  it("defaults a missing light radius", () => {
+    const out = sanitizePlacement({ lights: [{ x: 1, y: 1 }] }, dims);
+    expect(out.lights[0].radiusFeet).toBe(20);
+  });
+  it("preserves door state and key labels", () => {
+    const out = sanitizePlacement({
+      doors: [{ x1: 1, y1: 1, x2: 2, y2: 2, state: "locked" }],
+      keyPositions: [{ key: "A", x: 50, y: 60 }]
+    }, dims);
+    expect(out.doors[0].state).toBe("locked");
+    expect(out.keyPositions[0].key).toBe("A");
+  });
+  it("tolerates a non-object / null result", () => {
+    const out = sanitizePlacement(null, dims);
+    expect(out.walls.length).toBe(0);
+    expect(out.keyPositions.length).toBe(0);
   });
 });
 

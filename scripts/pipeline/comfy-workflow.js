@@ -1,117 +1,150 @@
 /**
  * Programmatic ComfyUI workflow builder — Flux 2 Klein.
  *
- * Flux uses a different stack from SDXL: a UNet (diffusion model) loader, a
- * DUAL CLIP loader (clip_l + a T5 text encoder), and a separate VAE — not a
- * single all-in-one checkpoint. Flux's T5 encoder follows natural-language
- * instructions well, which is what we lean on here.
+ * Flux 2 Klein uses its own node stack (distinct from Flux 1 / SDXL):
+ *   - UNETLoader              the diffusion model (flux-2-klein-base-9b-fp8)
+ *   - CLIPLoader (type flux2) a SINGLE text encoder — Qwen3
+ *   - VAELoader               flux2-vae
+ *   - CLIPTextEncode ×2       positive + (empty) negative conditioning
+ *   - CFGGuider               cfg-based guidance
+ *   - KSamplerSelect          sampler (euler)
+ *   - RandomNoise             seed
+ *   - SamplerCustomAdvanced   the sampler
+ *   - VAEDecode → SaveImage
  *
- * Two graph shapes:
+ * The image pipeline is IMAGE-FIRST (see docs/map-generation.md): the map
+ * picture is produced first, then walls/lights are placed by a vision model
+ * that looks at it. So there are three graph shapes:
  *
- *  buildPortraitWorkflow()  — plain txt2img for character/monster tokens.
+ *  buildPortraitWorkflow()  — txt2img for character/monster tokens.
+ *  buildTextToImageMap()    — txt2img for described-only & encounter maps
+ *                             (no source plate — paint from the prompt).
+ *  buildColorizeWorkflow()  — low-denoise img2img: take a scanned map plate,
+ *                             upscale it, and re-paint it in colour while
+ *                             keeping its structure (rooms, corridors, labels)
+ *                             intact. Uses BasicScheduler's `denoise` so only
+ *                             the tail of the schedule runs — the source is
+ *                             preserved, not reimagined.
  *
- *  buildMapWorkflow()       — IMG2IMG redraw. We hand Flux a rendered
- *    reference image that ALREADY has each sub-area outlined and labeled with
- *    its description (drawn by the scene builder), plus a text prompt that
- *    lists the areas. Flux repaints each labeled region in place as the thing
- *    the label says. No ControlNet, no regional-conditioning nodes — the
- *    labels in the reference image carry the spatial information, and a
- *    moderate denoise keeps the layout while replacing the flat labels with
- *    painted terrain/rooms. (Foundry map-note pins still provide the
- *    player-facing keyed labels; the labels baked into the reference are only
- *    guidance for the model and are painted over.)
- *
- * Node ids are strings; class_types are stock ComfyUI Flux nodes.
+ * Node ids are strings; class_types are stock ComfyUI Flux 2 nodes.
  */
 
-// ---- Flux loader defaults (overridable via settings) ----
+// ---- Flux 2 Klein loader defaults (overridable via settings) ----
 export const FLUX_DEFAULTS = {
-  unet: "flux2-klein.safetensors",
-  clipL: "clip_l.safetensors",
-  t5: "t5xxl_fp16.safetensors",
-  vae: "ae.safetensors",
-  steps: 28,
-  guidance: 3.5
+  unet: "flux-2-klein-base-9b-fp8.safetensors",
+  clip: "qwen_3_8b_fp8mixed.safetensors",
+  vae: "flux2-vae.safetensors",
+  steps: 20,
+  cfg: 5
 };
 
-/** Shared Flux loader + text-encode preamble. Returns node ids. */
-function fluxBase(node, ref, { unet, clipL, t5, vae, prompt, guidance }) {
+/** Shared Flux 2 loaders + positive/negative text-encode. Returns node ids. */
+function fluxBase(node, ref, { unet, clip, vae, prompt }) {
   const unetNode = node("UNETLoader", { unet_name: unet, weight_dtype: "default" });
-  const clip = node("DualCLIPLoader", { clip_name1: clipL, clip_name2: t5, type: "flux" });
+  const clipNode = node("CLIPLoader", { clip_name: clip, type: "flux2", device: "default" });
   const vaeNode = node("VAELoader", { vae_name: vae });
-  const cond = node("CLIPTextEncode", { clip: ref(clip), text: prompt });
-  const guided = node("FluxGuidance", { conditioning: ref(cond), guidance });
-  // Flux is distilled and runs without a real negative; an empty cond keeps
-  // the KSampler node's negative input satisfied.
-  const empty = node("CLIPTextEncode", { clip: ref(clip), text: "" });
-  return { unetNode, clip, vaeNode, guided, empty };
+  const positive = node("CLIPTextEncode", { clip: ref(clipNode), text: prompt });
+  // Flux runs without a real negative; an empty conditioning satisfies CFGGuider.
+  const negative = node("CLIPTextEncode", { clip: ref(clipNode), text: "" });
+  return { unetNode, clipNode, vaeNode, positive, negative };
 }
 
-/**
- * Character/monster portrait (txt2img).
- * @returns {object} API-format workflow
- */
-export function buildPortraitWorkflow({
-  prompt, width = 1024, height = 1024, seed,
-  unet = FLUX_DEFAULTS.unet, clipL = FLUX_DEFAULTS.clipL, t5 = FLUX_DEFAULTS.t5,
-  vae = FLUX_DEFAULTS.vae, steps = FLUX_DEFAULTS.steps, guidance = FLUX_DEFAULTS.guidance
-}) {
+/** Make the per-graph `node`/`ref` helpers and the graph object. */
+function graph() {
   const g = {};
   let id = 0;
   const node = (t, i) => { g[String(++id)] = { class_type: t, inputs: i }; return String(id); };
   const ref = (n, s = 0) => [n, s];
+  return { g, node, ref };
+}
 
-  const { unetNode, vaeNode, guided, empty } = fluxBase(node, ref, { unet, clipL, t5, vae, prompt, guidance });
-  const latent = node("EmptyLatentImage", { width: snap16(width), height: snap16(height), batch_size: 1 });
-  const sampler = node("KSampler", {
-    model: ref(unetNode), positive: ref(guided), negative: ref(empty), latent_image: ref(latent),
-    seed, steps, cfg: 1.0, sampler_name: "euler", scheduler: "simple", denoise: 1.0
+/**
+ * Shared txt2img builder (Flux2Scheduler + EmptyFlux2LatentImage). Used by
+ * both the portrait and text-to-image-map graphs.
+ */
+function txt2img({ prompt, width, height, seed, unet, clip, vae, steps, cfg, filename }) {
+  const { g, node, ref } = graph();
+  const W = snap16(width), H = snap16(height);
+  const { unetNode, vaeNode, positive, negative } = fluxBase(node, ref, { unet, clip, vae, prompt });
+  const latent = node("EmptyFlux2LatentImage", { width: W, height: H, batch_size: 1 });
+  const samplerSel = node("KSamplerSelect", { sampler_name: "euler" });
+  const noise = node("RandomNoise", { noise_seed: seed });
+  const sigmas = node("Flux2Scheduler", { steps, width: W, height: H });
+  const guider = node("CFGGuider", { cfg, model: ref(unetNode), positive: ref(positive), negative: ref(negative) });
+  const sampled = node("SamplerCustomAdvanced", {
+    noise: ref(noise), guider: ref(guider), sampler: ref(samplerSel), sigmas: ref(sigmas), latent_image: ref(latent)
   });
-  const decoded = node("VAEDecode", { samples: ref(sampler), vae: ref(vaeNode) });
-  node("SaveImage", { images: ref(decoded), filename_prefix: "acks-importer-token" });
+  const decoded = node("VAEDecode", { samples: ref(sampled), vae: ref(vaeNode) });
+  node("SaveImage", { images: ref(decoded), filename_prefix: filename });
   return g;
 }
 
+/** Character/monster portrait (txt2img). @returns {object} API-format workflow */
+export function buildPortraitWorkflow(opts) {
+  return txt2img({ width: 1024, height: 1024, ...defaults(opts), filename: "acks-importer-token" });
+}
+
 /**
- * Map (img2img redraw of a labeled reference image).
- * @param {object} opts
- * @param {string} opts.prompt          text listing the areas + global style
- * @param {string} opts.referenceImage  uploaded ComfyUI image name (the
- *                                       labeled blueprint the scene builder
- *                                       rendered and uploaded)
- * @param {number} opts.denoise         0.55–0.85: lower preserves the labeled
- *                                       layout more, higher repaints harder
+ * Map painted from a text description (txt2img) — used for described-only maps
+ * and wilderness encounter maps, where there is no source plate to colour.
  * @returns {object} API-format workflow
  */
-export function buildMapWorkflow({
-  prompt, referenceImage, width = 1024, height = 1024, seed,
-  denoise = 0.72,
-  unet = FLUX_DEFAULTS.unet, clipL = FLUX_DEFAULTS.clipL, t5 = FLUX_DEFAULTS.t5,
-  vae = FLUX_DEFAULTS.vae, steps = FLUX_DEFAULTS.steps, guidance = FLUX_DEFAULTS.guidance
+export function buildTextToImageMap(opts) {
+  return txt2img({ width: 1024, height: 1024, ...defaults(opts), filename: "acks-importer-map" });
+}
+
+/**
+ * Colorize + upscale a scanned map plate (low-denoise img2img). The plate is
+ * loaded, upscaled to a megapixel budget, VAE-encoded, and partially denoised
+ * — BasicScheduler's `denoise` keeps only the tail of the schedule, so the
+ * structure of the original map survives and only colour/detail is added.
+ *
+ * @param {object} opts
+ * @param {string} opts.prompt       what to paint (incl. per-room descriptions)
+ * @param {string} opts.sourceImage  uploaded ComfyUI image name (the plate)
+ * @param {number} opts.denoise      0.2–0.6; lower preserves the plate more
+ * @param {number} opts.upscaleMP    target megapixels for the upscale
+ * @returns {object} API-format workflow
+ */
+export function buildColorizeWorkflow({
+  prompt, sourceImage, seed, denoise = 0.4, upscaleMP = 2,
+  unet = FLUX_DEFAULTS.unet, clip = FLUX_DEFAULTS.clip, vae = FLUX_DEFAULTS.vae,
+  steps = FLUX_DEFAULTS.steps, cfg = FLUX_DEFAULTS.cfg
 }) {
-  const g = {};
-  let id = 0;
-  const node = (t, i) => { g[String(++id)] = { class_type: t, inputs: i }; return String(id); };
-  const ref = (n, s = 0) => [n, s];
+  const { g, node, ref } = graph();
+  const { unetNode, vaeNode, positive, negative } = fluxBase(node, ref, { unet, clip, vae, prompt });
 
-  const { unetNode, vaeNode, guided, empty } = fluxBase(node, ref, { unet, clipL, t5, vae, prompt, guidance });
-
-  // Load the labeled reference image and scale it to the generation size, then
-  // encode to a latent we partially denoise (img2img).
-  const loaded = node("LoadImage", { image: referenceImage });
-  const scaled = node("ImageScale", {
-    image: ref(loaded), width: snap16(width), height: snap16(height),
-    upscale_method: "lanczos", crop: "disabled"
+  // Load the plate, upscale to the megapixel budget, and encode it as the
+  // starting latent for a partial-denoise img2img.
+  const loaded = node("LoadImage", { image: sourceImage });
+  const scaled = node("ImageScaleToTotalPixels", {
+    upscale_method: "lanczos", megapixels: upscaleMP, resolution_steps: 1, image: ref(loaded)
   });
   const encoded = node("VAEEncode", { pixels: ref(scaled), vae: ref(vaeNode) });
-  const sampler = node("KSampler", {
-    model: ref(unetNode), positive: ref(guided), negative: ref(empty), latent_image: ref(encoded),
-    seed, steps, cfg: 1.0, sampler_name: "euler", scheduler: "simple", denoise
+
+  const samplerSel = node("KSamplerSelect", { sampler_name: "euler" });
+  const noise = node("RandomNoise", { noise_seed: seed });
+  // BasicScheduler's denoise truncates the sigma schedule → img2img strength.
+  const sigmas = node("BasicScheduler", {
+    model: ref(unetNode), scheduler: "simple", steps, denoise: clampDenoise(denoise)
   });
-  const decoded = node("VAEDecode", { samples: ref(sampler), vae: ref(vaeNode) });
+  const guider = node("CFGGuider", { cfg, model: ref(unetNode), positive: ref(positive), negative: ref(negative) });
+  const sampled = node("SamplerCustomAdvanced", {
+    noise: ref(noise), guider: ref(guider), sampler: ref(samplerSel), sigmas: ref(sigmas), latent_image: ref(encoded)
+  });
+  const decoded = node("VAEDecode", { samples: ref(sampled), vae: ref(vaeNode) });
   node("SaveImage", { images: ref(decoded), filename_prefix: "acks-importer-map" });
   return g;
 }
+
+/** Apply Flux loader/sampler defaults to a partial options object. */
+function defaults(o = {}) {
+  return {
+    unet: FLUX_DEFAULTS.unet, clip: FLUX_DEFAULTS.clip, vae: FLUX_DEFAULTS.vae,
+    steps: FLUX_DEFAULTS.steps, cfg: FLUX_DEFAULTS.cfg, ...o
+  };
+}
+function clampDenoise(d) { const n = Number(d); return Number.isFinite(n) ? Math.min(0.9, Math.max(0.1, n)) : 0.4; }
 
 // Flux prefers dimensions that are multiples of 16.
 export function snap16(v) { return Math.max(16, Math.round(v / 16) * 16); }

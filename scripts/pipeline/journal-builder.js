@@ -26,36 +26,19 @@ export async function buildJournals(extracted, sceneByMap, folderId) {
     });
     journals.push(journal);
 
-    // Map notes: pin each page onto its scene at the room key position.
+    // Map notes: pin each page onto its scene at the keyed-area center the
+    // vision placement pass reported (image pixels = scene pixels). Only indoor
+    // scenes carry keyPositions; outdoor maps have no geometry, so no pins.
     const scene = sceneByMap.get(mapName);
-    const layout = scene?.flags?.["acks-classic-importer"]?.layout;
-    if (scene && layout) {
+    const keyPositions = scene?.flags?.["acks-classic-importer"]?.keyPositions;
+    if (scene && keyPositions?.length) {
+      const byKey = new Map(keyPositions.map((k) => [String(k.key).trim().toLowerCase(), k]));
       const notes = [];
-      const px = scene.grid.size, off = px;
-      const isHex = scene.flags["acks-classic-importer"].hex;
       for (const page of journal.pages) {
-        const key = page.name.split(".")[0].trim();
-        if (isHex) {
-          // Hex wilderness: match by feature name token overlap.
-          const feat = (layout.features ?? []).find((f) =>
-            String(f.name ?? "").toLowerCase().includes(key.toLowerCase()) ||
-            page.name.toLowerCase().includes(String(f.name ?? "").toLowerCase())
-          );
-          if (!feat) continue;
-          const x = off * 0.75 + (feat.col + (feat.row % 2 ? 0.5 : 0)) * px;
-          const y = off * 0.75 + feat.row * px * 0.866;
-          notes.push({ entryId: journal.id, pageId: page.id, x: Math.round(x), y: Math.round(y), text: page.name, fontSize: 24 });
-          continue;
-        }
-        const room = (layout.rooms ?? []).find((r) => String(r.key).trim() === key);
-        if (!room) continue;
-        const cx = room.polygon.reduce((s, p) => s + p[0], 0) / room.polygon.length;
-        const cy = room.polygon.reduce((s, p) => s + p[1], 0) / room.polygon.length;
-        notes.push({
-          entryId: journal.id, pageId: page.id,
-          x: off + cx * px, y: off + cy * px,
-          text: page.name, fontSize: 24
-        });
+        const key = page.name.split(".")[0].trim().toLowerCase();
+        const pos = byKey.get(key);
+        if (!pos) continue;
+        notes.push({ entryId: journal.id, pageId: page.id, x: Math.round(pos.x), y: Math.round(pos.y), text: page.name, fontSize: 24 });
       }
       if (notes.length) await scene.createEmbeddedDocuments("Note", notes);
     }

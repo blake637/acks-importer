@@ -26,6 +26,10 @@ class DebugLogClass {
     this.entries = [];
     this.max = 300;
     this._id = 0;
+    // Optional sink invoked whenever the log changes (a call is recorded or
+    // settled). The e2e harness uses it to flush the log to disk synchronously,
+    // so even a native crash that aborts the process leaves a full paper trail.
+    this.onChange = null;
   }
 
   /** Record a call; returns the (mutable) entry so the caller can attach the
@@ -34,15 +38,23 @@ class DebugLogClass {
     const entry = { id: ++this._id, time: new Date().toISOString(), status: "pending", ...data };
     this.entries.push(entry);
     if (this.entries.length > this.max) this.entries.shift();
+    this.touch();
     return entry;
   }
+
+  /** Notify the change sink (no-op unless one is attached). */
+  touch() { try { this.onChange?.(this.entries); } catch { /* logging must never break the run */ } }
 
   get count() { return this.entries.length; }
 
   clear() { this.entries = []; }
 
   export() {
-    const safe = this.entries.map((e) => ({ ...e, thumbnail: e.thumbnail ? "(image omitted from export — see session)" : undefined }));
+    const safe = this.entries.map((e) => ({
+      ...e,
+      thumbnail: e.thumbnail ? "(image omitted from export — see session)" : undefined,
+      inputImages: e.inputImages?.length ? `(${e.inputImages.length} input image(s) omitted from export — see session)` : undefined
+    }));
     saveDataToFile(JSON.stringify(safe, null, 2), "text/json", `acks-importer-ai-log-${Date.now()}.json`);
   }
 
@@ -60,6 +72,7 @@ class DebugLogClass {
           ${e.system ? `<h4>System prompt</h4><pre>${esc(clip(e.system))}</pre>` : ""}
           ${e.prompt ? `<h4>Prompt</h4><pre>${esc(clip(e.prompt))}</pre>` : ""}
           ${e.user ? `<h4>User content</h4><pre>${esc(clip(e.user))}</pre>` : ""}
+          ${e.inputImages?.length ? `<h4>Image input(s) sent to the model</h4><div class="aci-inputs">${e.inputImages.map((t) => `<img class="aci-thumb" src="${t}" />`).join("")}</div>` : ""}
           ${e.response ? `<h4>Response</h4><pre>${esc(clip(e.response))}</pre>` : ""}
           ${e.thumbnail ? `<h4>Result</h4><img class="aci-thumb" src="${e.thumbnail}" />` : ""}
           ${e.error ? `<h4>Error</h4><pre class="aci-error">${esc(clip(e.error))}</pre>` : ""}
@@ -82,8 +95,9 @@ class DebugLogClass {
 
 export const DebugLog = new DebugLogClass();
 
-/** Downscale an image dataUrl to a small thumbnail for the inspector. */
-export async function makeThumbnail(dataUrl, maxDim = 160) {
+/** Downscale an image dataUrl to a thumbnail for the inspector / e2e artifacts.
+ *  512 keeps map detail legible (the full-res image is still saved separately). */
+export async function makeThumbnail(dataUrl, maxDim = 512) {
   try {
     const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = dataUrl; });
     const s = Math.min(1, maxDim / Math.max(img.width, img.height));

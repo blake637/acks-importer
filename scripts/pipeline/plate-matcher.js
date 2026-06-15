@@ -43,7 +43,10 @@ export async function identifyMapPlates(pageImages, { onProgress, maxPlates = 14
       const meta = await llm.completeJSON(PLATE_SYSTEM, [
         { type: "image", dataUrl: p.dataUrl },
         { type: "text", text: `This is page ${p.page} of the PDF.` }
-      ], 2000, { label: `Plate identification — page ${p.page}` });
+        // Generous cap (hosted only; local runs uncapped): the plate JSON is
+        // tiny, but reasoning models need room to think before answering — a
+        // low cap made them hit finish_reason:length and return nothing.
+      ], 8000, { label: `Plate identification — page ${p.page}` });
       if (meta?.isMap) plates.push({ page: p.page, dataUrl: p.dataUrl, ...meta });
       else log(`Page ${p.page}: not a map (vision pass)`);
     } catch (e) {

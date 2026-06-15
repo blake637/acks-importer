@@ -2,12 +2,12 @@
  * Image generation client + deterministic fallbacks.
  *
  * Two asset types are produced:
- *   - Tokens/portraits for actors
- *   - Top-down battlemap backgrounds for scenes
+ *   - Tokens/portraits for actors (txt2img / letter-disc fallback)
+ *   - Top-down battlemap backgrounds for scenes (txt2img from a description, or
+ *     a low-denoise img2img "colorize" of a scanned plate)
  *
- * If no image provider is configured, fallbacks are used:
- *   - Tokens: generated letter-disc PNGs (initial on a colored disc)
- *   - Maps:   the deterministic line-map renderer in scene-builder.js
+ * Maps require an image provider (there is no deterministic map fallback). If
+ * none is configured, actors still get generated letter-disc tokens.
  *
  * Generated files are uploaded to the world's data directory under
  * worlds/<world>/acks-importer/.
@@ -15,7 +15,7 @@
 
 import { getSetting } from "../settings.js";
 import { warn } from "../util/logger.js";
-import { buildMapWorkflow, buildPortraitWorkflow, FLUX_DEFAULTS } from "./comfy-workflow.js";
+import { buildColorizeWorkflow, buildTextToImageMap, buildPortraitWorkflow, FLUX_DEFAULTS } from "./comfy-workflow.js";
 import { DebugLog, makeThumbnail } from "../util/debug-log.js";
 
 export class ImageClient {
@@ -31,25 +31,38 @@ export class ImageClient {
   /**
    * @param {string} prompt
    * @param {object} opts
-   *   width/height        — output size
-   *   referenceImageDataUrl — for MAP generation: a labeled reference image
-   *                           Flux redraws via img2img (no ControlNet). When
-   *                           absent, generation is plain txt2img (portraits).
-   *   denoise             — img2img strength for maps (default 0.72)
+   *   mode               — "portrait" | "txt2img" | "colorize"
+   *                          portrait/txt2img paint from the prompt; colorize is
+   *                          a low-denoise img2img that recolours+upscales a
+   *                          source plate while keeping its structure.
+   *   width/height       — output size (txt2img modes)
+   *   sourceImageDataUrl — the plate to colorize (mode "colorize")
+   *   denoise/upscaleMP  — colorize strength and upscale budget
    * @returns {Promise<string>} dataUrl of a generated PNG
    */
-  async generate(prompt, { width = 1024, height = 1024, referenceImageDataUrl = null, denoise = 0.72, negative = "text, letters, numbers, labels, watermark, blurry, photo, perspective view, 3d render", label = "Image generation" } = {}) {
+  async generate(prompt, {
+    mode = "portrait", width = 1024, height = 1024,
+    sourceImageDataUrl = null, denoise, upscaleMP,
+    negative = "text, letters, numbers, labels, watermark, blurry, photo, perspective view, 3d render",
+    label = "Image generation"
+  } = {}) {
     if (!this.enabled) throw new Error("Image provider not configured");
+    if (mode === "colorize" && !sourceImageDataUrl) { mode = "txt2img"; } // nothing to colorize → paint from prompt
     const entry = DebugLog.record({
       kind: "image", label,
       provider: this.provider, model: this.model,
       prompt,
-      images: referenceImageDataUrl ? 1 : 0,
-      note: referenceImageDataUrl ? "Flux img2img redraw of a labeled reference image" : "txt2img"
+      images: sourceImageDataUrl ? 1 : 0,
+      note: mode === "colorize" ? "Flux 2 Klein colorize+upscale (low-denoise img2img)" : mode
     });
+    // Record the source plate we hand to the image model so it's visible
+    // alongside the generated result in the inspector / e2e artifacts.
+    if (sourceImageDataUrl) {
+      entry.inputImages = [await makeThumbnail(sourceImageDataUrl, 512)].filter(Boolean);
+    }
     const started = Date.now();
     try {
-      const dataUrl = await this.#generateInner(prompt, { width, height, referenceImageDataUrl, denoise, negative });
+      const dataUrl = await this.#generateInner(prompt, { mode, width, height, sourceImageDataUrl, denoise, upscaleMP, negative });
       entry.status = "ok";
       entry.ms = Date.now() - started;
       entry.thumbnail = await makeThumbnail(dataUrl);
@@ -59,11 +72,13 @@ export class ImageClient {
       entry.error = String(e?.message ?? e);
       entry.ms = Date.now() - started;
       throw e;
+    } finally {
+      DebugLog.touch(); // flush settled state before any synchronous work that could crash
     }
   }
 
-  async #generateInner(prompt, { width, height, referenceImageDataUrl, denoise, negative }) {
-    if (this.provider === "comfyui") return this.#comfy(prompt, { width, height, referenceImageDataUrl, denoise, negative });
+  async #generateInner(prompt, { mode, width, height, sourceImageDataUrl, denoise, upscaleMP, negative }) {
+    if (this.provider === "comfyui") return this.#comfy(prompt, { mode, width, height, sourceImageDataUrl, denoise, upscaleMP, negative });
     if (this.provider === "openai") {
       const res = await fetch(this.endpoint || "https://api.openai.com/v1/images/generations", {
         method: "POST",
@@ -104,13 +119,13 @@ export class ImageClient {
 
   /* ---------- ComfyUI ----------
    * Two paths:
-   *   - Built-in (default): the workflow graph is constructed in code per
-   *     map (ControlNet on the blueprint + N regional prompts), because a
-   *     static JSON cannot express a variable number of regions.
+   *   - Built-in (default): one of three Flux 2 Klein graphs by mode —
+   *     portrait/txt2img paint from the prompt; colorize is a low-denoise
+   *     img2img that recolours+upscales an uploaded source plate.
    *   - Custom override: a user-pasted API-format workflow with placeholder
    *     substitution (%%PROMPT%% etc.), for non-Flux or exotic pipelines.
    */
-  async #comfy(prompt, { width, height, referenceImageDataUrl, denoise, negative }) {
+  async #comfy(prompt, { mode, width, height, sourceImageDataUrl, denoise, upscaleMP, negative }) {
     const base = (this.endpoint || "http://127.0.0.1:8188").replace(/\/+$/, "");
     const customSrc = getSetting("comfyWorkflow")?.trim();
 
@@ -119,8 +134,8 @@ export class ImageClient {
       if (customSrc) {
         let initName = null;
         if (customSrc.includes("%%INIT_IMAGE%%")) {
-          initName = referenceImageDataUrl ? await this.#comfyUpload(base, referenceImageDataUrl) : "";
-          if (!referenceImageDataUrl) warn("Custom workflow expects %%INIT_IMAGE%% but no reference image was provided.");
+          initName = sourceImageDataUrl ? await this.#comfyUpload(base, sourceImageDataUrl) : "";
+          if (!sourceImageDataUrl) warn("Custom workflow expects %%INIT_IMAGE%% but no source image was provided.");
         }
         workflow = substitutePlaceholders(JSON.parse(customSrc), {
           "%%PROMPT%%": prompt,
@@ -136,17 +151,19 @@ export class ImageClient {
         // falling back to common defaults; the model field overrides the UNet.
         const flux = {
           unet: getSetting("fluxUnet")?.trim() || this.model || FLUX_DEFAULTS.unet,
-          clipL: getSetting("fluxClipL")?.trim() || FLUX_DEFAULTS.clipL,
-          t5: getSetting("fluxT5")?.trim() || FLUX_DEFAULTS.t5,
+          clip: getSetting("fluxClip")?.trim() || FLUX_DEFAULTS.clip,
           vae: getSetting("fluxVae")?.trim() || FLUX_DEFAULTS.vae
         };
         const seed = Math.floor(Math.random() * 2 ** 31);
-        if (referenceImageDataUrl) {
-          // MAP: img2img redraw of the labeled reference image.
-          const referenceImage = await this.#comfyUpload(base, referenceImageDataUrl);
-          workflow = buildMapWorkflow({ prompt, referenceImage, width, height, seed, denoise: denoise ?? 0.72, ...flux });
+        if (mode === "colorize") {
+          // MAP: colorize + upscale the scanned plate (low-denoise img2img).
+          const sourceImage = await this.#comfyUpload(base, sourceImageDataUrl);
+          workflow = buildColorizeWorkflow({ prompt, sourceImage, seed, denoise, upscaleMP, ...flux });
+        } else if (mode === "txt2img") {
+          // MAP: paint a battlemap from the description.
+          workflow = buildTextToImageMap({ prompt, width, height, seed, ...flux });
         } else {
-          // PORTRAIT: plain txt2img.
+          // PORTRAIT: token art.
           workflow = buildPortraitWorkflow({ prompt, width, height, seed, ...flux });
         }
       }

@@ -190,10 +190,10 @@ export class ActorBuilder {
     const a = entity.acks;
     const desc = [a.description, a.behavior].filter(Boolean).join(". ");
     if (entity.type === "monster") {
-      return `Fantasy RPG monster token portrait, top-lit, painterly, dark neutral background, centered bust: ${entity.name}. ${desc || ""} Old-school dungeon crawl aesthetic, no text, no border.`;
+      return `Fantasy monster token portrait, top-lit, photo realistic, dark neutral background, centered bust: ${entity.name}. ${desc || ""} Old-school dungeon crawl aesthetic, no text, no border.`;
     }
     const cls = [a.race, a.class, a.level ? `level ${a.level}` : null].filter(Boolean).join(" ");
-    return `Fantasy RPG character token portrait, painterly, parchment-toned background, centered bust: ${entity.name}, a ${cls || "villager"}. ${desc || ""} Carrying: ${(a.equipment ?? []).slice(0, 3).join(", ")}. No text, no border.`;
+    return `Fantasy character token portrait, photo realistic, parchment-toned background, centered bust: ${entity.name}, a ${cls || "villager"}. ${desc || ""} Carrying: ${(a.equipment ?? []).slice(0, 3).join(", ")}. No text, no border.`;
   }
 
   #biography(entity, purse = null) {

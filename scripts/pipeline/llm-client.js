@@ -17,7 +17,7 @@
 
 import { getSetting } from "../settings.js";
 import { warn } from "../util/logger.js";
-import { DebugLog, recoverMalformedOutput, PipelineAbortError } from "../util/debug-log.js";
+import { DebugLog, makeThumbnail, recoverMalformedOutput, PipelineAbortError } from "../util/debug-log.js";
 
 export class LLMClient {
   constructor() {
@@ -26,28 +26,57 @@ export class LLMClient {
     this.model = getSetting("llmModel");
     this.endpoint = normalizeEndpoint(getSetting("llmEndpoint"), this.provider);
     this.dialect = detectDialect(this.endpoint, this.provider);
+    // A configured endpoint means a local / self-hosted server. We do NOT cap
+    // output tokens there: thinking models (Qwen, DeepSeek-style) spend their
+    // budget on hidden reasoning and a low cap truncates them before they emit
+    // the answer. Hosted providers still get a cap (and Anthropic requires one).
+    this.local = !!String(getSetting("llmEndpoint") ?? "").trim();
+    // Per-request timeout. Browser fetch has no default ceiling and uncapped
+    // local reasoning models can run for minutes, so make it explicit and
+    // generous (configurable in settings).
+    this.timeoutMs = Math.max(30, Number(getSetting("llmTimeoutSec")) || 600) * 1000;
+  }
+
+  /** fetch() with the configured timeout and a clear message when it trips. */
+  async #fetch(url, opts) {
+    try {
+      return await fetch(url, { ...opts, signal: AbortSignal.timeout(this.timeoutMs) });
+    } catch (e) {
+      if (e?.name === "TimeoutError" || e?.name === "AbortError" || /timeout|timed out|aborted|headers timeout|body timeout/i.test(String(e?.message ?? e))) {
+        throw new Error(`LLM request timed out after ${Math.round(this.timeoutMs / 1000)}s (${url}). Raise "LLM request timeout" in module settings, or shorten the model's output/reasoning.`);
+      }
+      throw e;
+    }
   }
 
   /**
    * @param {string} system    system prompt
    * @param {Array} content    array of {type:"text",text} and/or {type:"image", dataUrl}
-   * @param {number} maxTokens
+   * @param {number} maxTokens output-token cap for hosted providers (Anthropic
+   *                           requires it). Ignored for local/self-hosted
+   *                           endpoints, which run uncapped.
    * @param {object} opts      { label } — stage label for the AI call inspector
    * @returns {Promise<string>} raw text response
    */
-  async complete(system, content, maxTokens = 8000, { label = "LLM call" } = {}) {
+  async complete(system, content, maxTokens = 16000, { label = "LLM call" } = {}) {
     // A key is mandatory only for the hosted defaults; local/custom endpoints
     // may run keyless.
     if (!this.key && !getSetting("llmEndpoint")) {
       throw new Error("No LLM API key configured (module settings). For a local server, set the endpoint URL instead — a key is optional there.");
     }
+    const imageParts = content.filter((c) => c.type === "image");
     const entry = DebugLog.record({
       kind: "llm", label,
       provider: this.dialect, model: this.model, endpoint: this.endpoint,
       system,
       user: content.filter((c) => c.type === "text").map((c) => c.text).join("\n\n"),
-      images: content.filter((c) => c.type === "image").length
+      images: imageParts.length
     });
+    // Keep a thumbnail of every image we actually send, so the inspector / e2e
+    // artifacts show exactly what the model saw (not just a count).
+    if (imageParts.length) {
+      entry.inputImages = (await Promise.all(imageParts.map((c) => makeThumbnail(c.dataUrl, 512)))).filter(Boolean);
+    }
     const started = Date.now();
     try {
       let raw;
@@ -69,6 +98,8 @@ export class LLMClient {
       entry.error = String(e?.message ?? e);
       entry.ms = Date.now() - started;
       throw e;
+    } finally {
+      DebugLog.touch(); // flush settled state before any synchronous work that could crash
     }
   }
 
@@ -78,7 +109,7 @@ export class LLMClient {
    *   (retry / hand-fix / continue-as-null / abort pipeline).
    * Callers MUST tolerate a null return ("continue without it").
    */
-  async completeJSON(system, content, maxTokens = 8000, { label = "LLM call" } = {}) {
+  async completeJSON(system, content, maxTokens = 16000, { label = "LLM call" } = {}) {
     while (true) {
       let raw = await this.complete(system + "\nRespond with valid JSON only. No prose, no markdown fences.", content, maxTokens, { label });
       let parsed = this.#tryParse(raw);
@@ -161,7 +192,7 @@ export class LLMClient {
         ? { type: "image", source: { type: "base64", media_type: "image/png", data: c.dataUrl.split(",")[1] } }
         : { type: "text", text: c.text }
     );
-    const res = await fetch(this.endpoint, {
+    const res = await this.#fetch(this.endpoint, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -192,7 +223,9 @@ export class LLMClient {
     if (this.key) headers.authorization = `Bearer ${this.key}`;
     const body = {
       model: this.model || "default",
-      max_tokens: maxTokens,
+      // Local servers run uncapped (see constructor): omit max_tokens so the
+      // server uses its own default (generate until EOS / context limit).
+      ...(this.local ? {} : { max_tokens: maxTokens }),
       stream: false,
       messages: [
         { role: "system", content: system },
@@ -201,7 +234,7 @@ export class LLMClient {
         { role: "user", content: hasImage ? parts : content.map((c) => c.text).join("\n\n") }
       ]
     };
-    const res = await fetch(this.endpoint, {
+    const res = await this.#fetch(this.endpoint, {
       method: "POST", headers, body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error(`LLM API ${res.status} at ${this.endpoint}: ${await res.text()}`);
@@ -224,11 +257,14 @@ export class LLMClient {
     const text = content.filter((c) => c.type === "text").map((c) => c.text).join("\n\n");
     const headers = { "content-type": "application/json" };
     if (this.key) headers.authorization = `Bearer ${this.key}`;
-    const res = await fetch(this.endpoint, {
+    const res = await this.#fetch(this.endpoint, {
       method: "POST", headers,
       body: JSON.stringify({
         prompt: `${system}\n\n${text}\n\nAssistant:`,
-        n_predict: maxTokens,
+        // Native /completion is always a local server: leave n_predict unset
+        // (llama.cpp defaults to -1 = generate until EOS / context limit) so a
+        // reasoning model isn't truncated before it emits the answer.
+        n_predict: -1,
         temperature: 0.2,
         stream: false
       })

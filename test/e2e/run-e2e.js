@@ -26,16 +26,38 @@
 import "./recording-shim.js";
 import { REC } from "./recording-shim.js";
 import { extractPdfNode } from "./pdf-extract-node.js";
+import { DebugLog } from "../../scripts/util/debug-log.js";
 import fs from "node:fs";
 import path from "node:path";
 
 const args = process.argv.slice(2);
 const pdfPath = args.find((a) => !a.startsWith("--"));
 const pagesLimit = num(flag("--pages")) ?? Infinity;
+// --page-range <spec>: run on specific pages, e.g. "1,2,7" or "3-10" or
+// "1,5-8,12". Overrides --pages (which is a count of leading pages). Real page
+// numbers are preserved so plate/sourcePage references stay correct.
+const pageSpec = flag("--page-range") ?? flag("--pages-list");
+const pageSet = pageSpec ? parsePageSpec(pageSpec) : null;
 const outDir = flag("--out") ?? path.join("test", "e2e", "artifacts", `run-${stamp()}`);
+// --only <stage[,stage...]>: run just part of the pipeline. Extraction +
+// conversion always run (prereqs). Stages: actors | maps | journals.
+// Aliases: scenes→maps, tables→journals. Default (no flag) = everything.
+const STAGE_ALIASES = { actors: "actors", maps: "maps", scenes: "maps", journals: "journals", tables: "journals" };
+const onlyArg = flag("--only");
+const stages = onlyArg
+  ? new Set(onlyArg.split(",").map((s) => STAGE_ALIASES[s.trim().toLowerCase()]).filter(Boolean))
+  : null;
 
 if (!pdfPath || !fs.existsSync(pdfPath)) {
-  console.error("Usage: node test/e2e/run-e2e.js <path-to.pdf> [--pages N] [--out DIR]");
+  console.error("Usage: node test/e2e/run-e2e.js <path-to.pdf> [--pages N] [--page-range 1,5-8] [--out DIR] [--only actors|maps|journals]");
+  process.exit(2);
+}
+if (onlyArg && (!stages || !stages.size)) {
+  console.error(`Unknown --only value "${onlyArg}". Use: actors, maps, journals (comma-separated).`);
+  process.exit(2);
+}
+if (pageSpec && (!pageSet || !pageSet.size)) {
+  console.error(`Unknown --page-range value "${pageSpec}". Use page numbers/ranges, e.g. "1,2,7" or "3-10".`);
   process.exit(2);
 }
 
@@ -46,15 +68,14 @@ Object.assign(S, {
   llmEndpoint: env("ACKS_LLM_ENDPOINT", ""),
   llmApiKey: env("ACKS_LLM_KEY", ""),
   llmModel: env("ACKS_LLM_MODEL", "gpt-4o-mini"),
+  llmTimeoutSec: Number(env("ACKS_LLM_TIMEOUT", "600")),
   imgProvider: env("ACKS_IMG_PROVIDER", "none"),
   imgEndpoint: env("ACKS_IMG_ENDPOINT", ""),
   imgApiKey: env("ACKS_IMG_KEY", ""),
-  imgModel: env("ACKS_IMG_MODEL", "flux2-klein.safetensors"),
-  fluxUnet: env("ACKS_IMG_MODEL", "flux2-klein.safetensors"),
-  fluxClipL: env("ACKS_FLUX_CLIPL", "clip_l.safetensors"),
-  fluxT5: env("ACKS_FLUX_T5", "t5xxl_fp16.safetensors"),
-  fluxVae: env("ACKS_FLUX_VAE", "ae.safetensors"),
-  mapDenoise: Number(env("ACKS_MAP_DENOISE", "0.72")),
+  imgModel: env("ACKS_IMG_MODEL", "flux-2-klein-base-9b-fp8.safetensors"),
+  fluxUnet: env("ACKS_IMG_MODEL", "flux-2-klein-base-9b-fp8.safetensors"),
+  fluxClip: env("ACKS_FLUX_CLIP", "qwen_3_8b_fp8mixed.safetensors"),
+  fluxVae: env("ACKS_FLUX_VAE", "flux2-vae.safetensors"),
   comfyWorkflow: env("ACKS_COMFY_WORKFLOW", ""),
   generateTokenArt: env("ACKS_IMG_PROVIDER", "none") !== "none",
   generateMapArt: env("ACKS_IMG_PROVIDER", "none") !== "none",
@@ -69,14 +90,42 @@ const startedAt = Date.now();
 console.log(`E2E: ${pdfPath}`);
 console.log(`  LLM:   ${S.llmProvider} ${S.llmModel} @ ${S.llmEndpoint || "(provider default)"}`);
 console.log(`  Image: ${S.imgProvider} ${S.imgModel} @ ${S.imgEndpoint || "-"}`);
+console.log(`  Stages:${stages ? " " + [...stages].join(", ") + " only" : " all"}`);
 console.log(`  Out:   ${outDir}\n`);
+
+// Incrementally flush the AI-call log so that even a hard crash — e.g. a
+// native canvas abort that bypasses JS try/catch AND process exit hooks —
+// still leaves a paper trail. Between LLM/image calls the event loop is idle
+// long enough for this to fire; writeArtifacts() later overwrites it with the
+// richer version on a clean finish.
+mkdir(outDir);
+const callsPath = path.join(outDir, "ai-calls.json");
+const slimCall = (e) => ({
+  ...e,
+  thumbnail: e.thumbnail ? "(see ai-call-images/)" : undefined,
+  inputImages: e.inputImages?.length ? `(${e.inputImages.length} input image(s) — see ai-call-images/)` : undefined
+});
+const flushCalls = () => {
+  try {
+    fs.writeFileSync(callsPath, JSON.stringify(DebugLog.entries.map(slimCall), null, 2));
+  } catch { /* best effort — never let logging crash the run */ }
+};
+// Flush synchronously the moment any call is recorded or settles — the render
+// stages run synchronously right after a layout call returns, so a native
+// crash there would otherwise lose that call's response (the timer can't fire
+// mid-stack). The timer stays as a coarse backstop.
+DebugLog.onChange = flushCalls;
+const flushTimer = setInterval(flushCalls, 400);
+flushTimer.unref?.();
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { flushCalls(); process.exit(130); });
 
 let pipelineError = null;
 try {
   // Extract with the Node extractor, then drive the real pipeline.
   console.log("Extracting PDF (pdfjs + canvas)…");
-  const preExtracted = await extractPdfNode(pdfPath, { maxPages: pagesLimit });
-  console.log(`  ${preExtracted.pages.length} pages (of ${preExtracted.numPages}); ` +
+  const preExtracted = await extractPdfNode(pdfPath, pageSet ? { pageSet } : { maxPages: pagesLimit });
+  console.log(`  ${preExtracted.pages.length} pages (of ${preExtracted.numPages})` +
+    (pageSet ? ` [pages ${preExtracted.pages.map((p) => p.page).join(", ")}]` : "") + "; " +
     `${preExtracted.pageImages.filter((p) => p.isLikelyMap).length} candidate map plates\n`);
 
   // Import the real app AFTER the shim is installed.
@@ -90,7 +139,7 @@ try {
   app.render = () => app; // suppress UI render
 
   console.log("Running pipeline (live LLM/image calls)…\n");
-  await app.run({ name: path.basename(pdfPath) }, { preExtracted });
+  await app.run({ name: path.basename(pdfPath) }, { preExtracted, stages });
   console.log(`\nPipeline finished: stage = ${app.state?.stage}`);
 } catch (e) {
   pipelineError = e;
@@ -99,10 +148,16 @@ try {
 }
 
 // ---- write artifact tree ----
+clearInterval(flushTimer);
+flushCalls(); // capture the final settled state before the rich rewrite
 await writeArtifacts(outDir);
 
 const ms = Date.now() - startedAt;
-const ok = !pipelineError && REC.actors.length > 0;
+// Success: pipeline didn't throw, and when actors were in scope it produced
+// some (the original smoke signal). maps-only/journals-only runs just need to
+// complete without error.
+const wants = (n) => !stages || stages.has(n);
+const ok = !pipelineError && (!wants("actors") || REC.actors.length > 0);
 console.log(`\n${"─".repeat(56)}`);
 console.log(`  actors: ${REC.actors.length}  scenes: ${REC.scenes.length}  ` +
   `journals: ${REC.journals.length}  tables: ${REC.tables.length}`);
@@ -110,7 +165,7 @@ console.log(`  maps written: ${REC.files.filter((f) => f.name?.startsWith("map-"
   `tokens: ${REC.files.filter((f) => f.name?.startsWith("token-")).length}`);
 console.log(`  errors: ${REC.errors.length}  duration: ${(ms / 1000).toFixed(1)}s`);
 console.log(`  artifacts: ${outDir}`);
-console.log(`  result: ${ok ? "\x1b[32mPASS\x1b[0m (pipeline completed, actors produced)" : "\x1b[31mFAIL\x1b[0m"}`);
+console.log(`  result: ${ok ? `\x1b[32mPASS\x1b[0m (${stages ? [...stages].join("+") + " stage(s)" : "pipeline"} completed)` : "\x1b[31mFAIL\x1b[0m"}`);
 process.exitCode = ok ? 0 : 1;
 
 /* ---------- artifact writer ---------- */
@@ -122,11 +177,12 @@ async function writeArtifacts(dir) {
   let calls = [];
   try {
     const { DebugLog } = await import("../../scripts/util/debug-log.js");
-    calls = DebugLog.entries.map((e) => ({ ...e, thumbnail: e.thumbnail ? "(see images/)" : undefined }));
-    // save image thumbnails referenced in calls
+    calls = DebugLog.entries.map(slimCall);
+    // save both the generated-result thumbnail and every input image we sent
     const imgDir = sub("ai-call-images");
     for (const e of DebugLog.entries) {
       if (e.thumbnail) writeDataUrl(path.join(imgDir, `call-${e.id}.png`), e.thumbnail);
+      (e.inputImages ?? []).forEach((t, n) => writeDataUrl(path.join(imgDir, `call-${e.id}-input-${n + 1}.jpg`), t));
     }
   } catch (e) { REC.errors.push({ where: "DebugLog export", error: String(e?.message ?? e) }); }
   writeJson(path.join(dir, "ai-calls.json"), calls);
@@ -210,6 +266,16 @@ async function writeArtifacts(dir) {
 
 /* ---------- helpers ---------- */
 function flag(name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
+function parsePageSpec(spec) {
+  const set = new Set();
+  for (const part of String(spec).split(",")) {
+    const m = part.trim().match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    const a = Number(m[1]), b = m[2] ? Number(m[2]) : a;
+    for (let i = Math.min(a, b); i <= Math.max(a, b); i++) set.add(i);
+  }
+  return set;
+}
 function num(v) { return v === undefined ? undefined : Number(v); }
 function env(k, d) { return process.env[k] ?? d; }
 function stamp() { return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); }

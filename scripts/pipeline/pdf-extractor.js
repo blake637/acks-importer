@@ -6,11 +6,31 @@
  * Output:
  *   { pages: [{page, text}], pageImages: [{page, dataUrl, isLikelyMap}] }
  *
- * "Likely map" heuristic: pages with very little extractable text but lots of
- * rendered ink are usually map plates in TSR-era scans.
+ * "Likely map" heuristic: see isLikelyMapPage — TSR-era map plates are scanned
+ * images with almost no embedded text but real ink, whereas keyed text pages
+ * carry thousands of characters (and often MORE ink than a sparse line map, so
+ * ink ratio alone is a poor discriminator — text length is the real signal).
  */
 
 import { log, warn } from "../util/logger.js";
+
+/**
+ * Decide whether a rendered page is probably a map plate worth a vision pass.
+ * Biased toward recall: a false positive costs one vision call that simply
+ * answers "not a map", but a false negative loses a map entirely.
+ *
+ * @param {string} text       extracted page text
+ * @param {number} inkRatio   fraction of dark sampled pixels (0..1)
+ */
+export function isLikelyMapPage(text, inkRatio) {
+  const compact = String(text ?? "").replace(/\s/g, "").length;
+  if (inkRatio <= 0.02) return false;   // effectively blank (title/divider) → not a plate
+  if (compact < 200) return true;       // image-only page with real ink → almost certainly a scanned plate
+  // Vector maps can embed short keyed labels or a printed scale note; allow a
+  // keyword escape, but only for pages that aren't dense prose.
+  const mapKeyword = /\bmap\b|\bscale\b|\d\s*(?:square|hex|inch)e?s?\s*=|=\s*\d+\s*(?:feet|ft|mile|yard)/i.test(text ?? "");
+  return mapKeyword && compact < 1500;
+}
 
 let _pdfjs = null;
 
@@ -73,7 +93,7 @@ export async function extractPdf(file, { renderScale = 1.5, onProgress } = {}) {
     await page.render({ canvasContext: ctx, viewport }).promise;
 
     const inkRatio = estimateInkRatio(ctx, canvas.width, canvas.height);
-    const isLikelyMap = text.replace(/\s/g, "").length < 600 && inkRatio > 0.04;
+    const isLikelyMap = isLikelyMapPage(text, inkRatio);
     pageImages.push({ page: i, dataUrl: canvas.toDataURL("image/png"), isLikelyMap, inkRatio });
   }
 

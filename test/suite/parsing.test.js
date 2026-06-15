@@ -3,7 +3,7 @@ import { describe, it, expect } from "../harness.js";
 import { classifyGear, buildItemData, parseCoins, convertMagicItem } from "../../scripts/pipeline/item-builder.js";
 import { detectEdition } from "../../scripts/pipeline/edition-detect.js";
 import { chunkText } from "../../scripts/util/chunker.js";
-import { buildMapWorkflow, buildPortraitWorkflow, fitGenerationSize, snap8, snap16 } from "../../scripts/pipeline/comfy-workflow.js";
+import { buildColorizeWorkflow, buildTextToImageMap, buildPortraitWorkflow, fitGenerationSize, snap8, snap16 } from "../../scripts/pipeline/comfy-workflow.js";
 
 describe("gear classification", () => {
   it("classifies plain armor", () => {
@@ -112,45 +112,65 @@ describe("flux workflow builders", () => {
     expect(Math.max(f.genW, f.genH)).toBeLessThan(1537);
     expect(f.genW % 16).toBe(0);
   });
-  it("portrait workflow is txt2img Flux (UNet + dual CLIP + VAE, no checkpoint loader)", () => {
+  it("portrait workflow is txt2img Flux 2 Klein (UNet + single flux2 CLIP + VAE, no checkpoint loader)", () => {
     const g = buildPortraitWorkflow({ prompt: "a knight", width: 1024, height: 1024, seed: 7 });
     const types = Object.values(g).map((n) => n.class_type);
     expect(types).toContain("UNETLoader");
-    expect(types).toContain("DualCLIPLoader");
+    expect(types).toContain("CLIPLoader");
     expect(types).toContain("VAELoader");
-    expect(types).toContain("FluxGuidance");
-    expect(types).toContain("EmptyLatentImage");      // txt2img: empty latent
+    expect(types).toContain("CFGGuider");
+    expect(types).toContain("Flux2Scheduler");
+    expect(types).toContain("SamplerCustomAdvanced");
+    expect(types).toContain("EmptyFlux2LatentImage");   // txt2img: empty latent
+    // Flux 2 Klein uses a single Qwen3 CLIP, not the Flux 1 dual loader.
+    const clip = Object.values(g).find((n) => n.class_type === "CLIPLoader");
+    expect(clip.inputs.type).toBe("flux2");
+    expect(types.includes("DualCLIPLoader")).toBeFalsy();
+    expect(types.includes("FluxGuidance")).toBeFalsy();
+    expect(types.includes("KSampler")).toBeFalsy();
     expect(types.includes("CheckpointLoaderSimple")).toBeFalsy();
     expect(types.includes("ControlNetApplyAdvanced")).toBeFalsy();
   });
-  it("map workflow is img2img redraw (loads + encodes the reference image)", () => {
-    const g = buildMapWorkflow({ prompt: "dungeon: A chapel, B barracks", referenceImage: "ref.png", width: 1024, height: 768, seed: 3, denoise: 0.7 });
+  it("text-to-image map is txt2img Flux 2 Klein (no source image)", () => {
+    const g = buildTextToImageMap({ prompt: "a stone chapel interior", width: 1024, height: 1024, seed: 3 });
     const types = Object.values(g).map((n) => n.class_type);
-    expect(types).toContain("LoadImage");             // the labeled reference
-    expect(types).toContain("VAEEncode");             // img2img: encode it
-    expect(types.includes("EmptyLatentImage")).toBeFalsy();
-    const ksampler = Object.values(g).find((n) => n.class_type === "KSampler");
-    expect(ksampler.inputs.denoise).toBeCloseTo(0.7);
+    expect(types).toContain("EmptyFlux2LatentImage");
+    expect(types).toContain("Flux2Scheduler");
+    expect(types).toContain("SamplerCustomAdvanced");
+    expect(types.includes("LoadImage")).toBeFalsy();
+    expect(types.includes("VAEEncode")).toBeFalsy();
   });
-  it("all node refs resolve to existing nodes (portrait)", () => {
-    const g = buildPortraitWorkflow({ prompt: "p", width: 512, height: 512, seed: 1 });
+  it("colorize is a low-denoise img2img of a source plate", () => {
+    const g = buildColorizeWorkflow({ prompt: "colorize this dungeon", sourceImage: "plate.png", seed: 3, denoise: 0.4 });
+    const types = Object.values(g).map((n) => n.class_type);
+    expect(types).toContain("LoadImage");               // the scanned plate
+    expect(types).toContain("ImageScaleToTotalPixels"); // upscale
+    expect(types).toContain("VAEEncode");               // plate → starting latent
+    expect(types).toContain("BasicScheduler");          // denoise truncates the schedule
+    const sched = Object.values(g).find((n) => n.class_type === "BasicScheduler");
+    expect(sched.inputs.denoise).toBeCloseTo(0.4);
+    // img2img samples from the encoded plate, not an empty latent
+    expect(types.includes("EmptyFlux2LatentImage")).toBeFalsy();
+    expect(types.includes("ReferenceLatent")).toBeFalsy();
+  });
+  it("colorize clamps an out-of-range denoise", () => {
+    const g = buildColorizeWorkflow({ prompt: "p", sourceImage: "p.png", seed: 1, denoise: 5 });
+    const sched = Object.values(g).find((n) => n.class_type === "BasicScheduler");
+    expect(sched.inputs.denoise).toBeLessThan(1);
+  });
+  const refsResolve = (g) => {
     for (const node of Object.values(g)) {
       for (const v of Object.values(node.inputs)) {
         if (Array.isArray(v) && typeof v[0] === "string") expect(g[v[0]]).toBeTruthy();
       }
     }
-  });
-  it("all node refs resolve to existing nodes (map)", () => {
-    const g = buildMapWorkflow({ prompt: "p", referenceImage: "r.png", width: 512, height: 512, seed: 1 });
-    for (const node of Object.values(g)) {
-      for (const v of Object.values(node.inputs)) {
-        if (Array.isArray(v) && typeof v[0] === "string") expect(g[v[0]]).toBeTruthy();
-      }
-    }
-  });
+  };
+  it("all node refs resolve (portrait)", () => refsResolve(buildPortraitWorkflow({ prompt: "p", width: 512, height: 512, seed: 1 })));
+  it("all node refs resolve (txt2img map)", () => refsResolve(buildTextToImageMap({ prompt: "p", width: 512, height: 512, seed: 1 })));
+  it("all node refs resolve (colorize)", () => refsResolve(buildColorizeWorkflow({ prompt: "p", sourceImage: "p.png", seed: 1 })));
   it("dimensions are snapped to 16 in the graph", () => {
     const g = buildPortraitWorkflow({ prompt: "p", width: 1020, height: 1530, seed: 1 });
-    const latent = Object.values(g).find((n) => n.class_type === "EmptyLatentImage");
+    const latent = Object.values(g).find((n) => n.class_type === "EmptyFlux2LatentImage");
     expect(latent.inputs.width % 16).toBe(0);
     expect(latent.inputs.height % 16).toBe(0);
   });

@@ -47,14 +47,14 @@ export function parseHD(hdStr) {
 // Values: target numbers on d20 for [P&P, Poison&Death, Blast&Breath, Staffs&Wands, Spells]
 const ACKS_FIGHTER_SAVES = {
   0:  [16, 14, 17, 16, 18],
-  1:  [15, 14, 16, 16, 17],
-  2:  [14, 13, 15, 15, 16],
-  3:  [14, 13, 15, 15, 16],
-  4:  [13, 12, 14, 14, 15],
-  5:  [13, 12, 14, 14, 15],
-  6:  [12, 11, 13, 13, 14],
-  7:  [12, 11, 13, 13, 14],
-  8:  [11, 10, 12, 12, 13],
+  1:  [13, 14, 15, 16, 17],
+  2:  [12, 13, 14, 15, 16],
+  3:  [12, 13, 14, 15, 16],
+  4:  [11, 12, 13, 14, 15],
+  5:  [10, 11, 12, 13, 14],
+  6:  [10, 11, 12, 13, 14],
+  7:  [9, 10, 11, 12, 13],
+  8:  [8, 9, 10, 11, 12],
   9:  [11, 10, 12, 12, 13],
   10: [10,  9, 11, 11, 12],
   11: [10,  9, 11, 11, 12],
@@ -63,9 +63,11 @@ const ACKS_FIGHTER_SAVES = {
   14: [ 8,  7,  9,  9, 10]
 };
 export function savesForHD(effectiveHD) {
-  const lvl = Math.max(0, Math.min(14, Math.round(effectiveHD ?? 1)));
-  const [pp, pd, bb, sw, sp] = ACKS_FIGHTER_SAVES[lvl];
-  return { paralysis: pp, death: pd, breath: bb, wand: sw, spell: sp };
+  // const lvl = Math.max(0, Math.min(14, Math.round(effectiveHD ?? 1)));
+  // const [pp, pd, bb, sw, sp] = ACKS_FIGHTER_SAVES[lvl];
+  const hd = Number.isFinite(Number(effectiveHD)) ? Number(effectiveHD) : 1; // guard null/NaN HD
+  let base_save = 13 - Math.floor(hd/2)
+  return { paralysis: base_save, death: base_save+1, breath: base_save+2, wand: base_save+3, spell: base_save+4};
 }
 
 // ---------- XP (ACKS monster XP by HD + per-special-ability bonus) ----------

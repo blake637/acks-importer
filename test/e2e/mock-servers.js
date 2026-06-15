@@ -33,15 +33,24 @@ function llmReply(messages) {
   if (text.includes("map-plate cataloguer")) {
     return JSON.stringify({ isMap: true, title: "Mock Map", mapType: "dungeon", gridType: "square", scaleNote: "1 square = 10 feet", visibleKeys: ["A", "B"], multipleMaps: false });
   }
-  if (text.includes("cartography engine")) {
+  // Described-only map: build a txt2img prompt + indoor/outdoor classification.
+  if (text.includes("design a top-down tabletop battlemap")) {
+    return JSON.stringify({ imagePrompt: "top-down stone shrine interior, two rooms, orthographic", setting: "indoor" });
+  }
+  // Indoor placement read off the finished image (pixel coordinates).
+  if (text.includes("battlemap analyst")) {
     return JSON.stringify({
-      name: "Mock Map", gridType: "square", gridWidth: 12, gridHeight: 8, feetPerSquare: 10,
-      rooms: [{ key: "A", polygon: [[1, 1], [4, 1], [4, 4], [1, 4]], label: "Shrine" },
-        { key: "B", polygon: [[5, 1], [8, 1], [8, 4], [5, 4]], label: "Guard Room" }],
-      doors: [{ from: "A", to: "B", x1: 4, y1: 2, x2: 5, y2: 2, state: "closed" }],
-      windows: [], lights: [{ x: 2, y: 2, radiusFeet: 20, note: "torch" }], stairs: [],
-      tokenSpots: [{ ref: "Mock Priest", x: 2, y: 3 }, { ref: "Mock Bugbear", x: 6, y: 3 }]
+      walls: [{ x1: 100, y1: 100, x2: 400, y2: 100 }, { x1: 400, y1: 100, x2: 400, y2: 400 }],
+      doors: [{ x1: 400, y1: 200, x2: 400, y2: 250, state: "closed" }],
+      windows: [],
+      lights: [{ x: 200, y: 200, radiusFeet: 20 }],
+      tokenSpots: [{ ref: "Mock Priest", x: 200, y: 300 }, { ref: "Mock Bugbear", x: 600, y: 300 }],
+      keyPositions: [{ key: "A", x: 200, y: 200 }, { key: "B", x: 600, y: 200 }]
     });
+  }
+  // Wilderness terrain enumeration for encounter maps.
+  if (text.includes("distinct terrain types")) {
+    return JSON.stringify({ terrains: ["forest", "hills"] });
   }
   if (text.includes("repair malformed json")) return "{}";
   return JSON.stringify({ npcs: [], monsters: [], locations: [], rollTables: [], maps: [] });

@@ -70,7 +70,11 @@ export class ImporterApp extends Application {
     log(message);
   }
 
-  async run(file, { preExtracted = null } = {}) {
+  async run(file, { preExtracted = null, stages = null } = {}) {
+    // `stages` (a Set like {"actors"} or {"maps"}) restricts which OUTPUT
+    // stages run; null = all. Extraction + conversion always run (prereqs for
+    // both actors and maps). Accepted names: "actors", "maps", "journals".
+    const runStage = (name) => !stages || stages.has(name);
     try {
       this.state.stage = "running";
 
@@ -108,123 +112,150 @@ export class ImporterApp extends Application {
       };
       converted = await this.#review("ACKS conversions (with notes)", converted);
 
-      // ---------- 4. Actors ----------
+      // ---------- shared setup (always) ----------
       const moduleName = file.name.replace(/\.pdf$/i, "");
       const folders = await this.#folders(moduleName);
-      const builder = await new ActorBuilder().prepare();
-      const monsterIndex = await new MonsterIndex().build();
       const occupants = new Map(); // normalized locationRef → {actorId}
+      const sceneByMap = new Map();
 
-      let i = 0, failed = 0;
-      for (const npc of converted.npcs) {
-        this.#status(`Creating NPC ${++i}/${converted.npcs.length}: ${npc.name}`, 0.45 + 0.15 * (i / Math.max(1, converted.npcs.length)));
-        try {
-          const actor = await builder.buildActor(npc, { folderId: folders.npcs.id });
-          if (!actor?.id) throw new Error("Actor.create returned no document");
-          if (npc.locationRef) occupants.set(normRef(npc.locationRef) + "|" + normRef(npc.name), { actorId: actor.id });
-          occupants.set(normRef(npc.name), { actorId: actor.id });
-        } catch (e) {
-          failed++;
-          warn(`NPC "${npc.name}" failed; skipping`, e);
-          this.#status(`⚠ NPC "${npc.name}" failed (${e.message}) — skipped. See AI Call Inspector.`);
-        }
-      }
-
-      i = 0;
-      let reused = 0;
-      for (const mon of converted.monsters) {
-        i++;
-        try {
-          const existing = monsterIndex.find(mon.name);
-          if (existing && !this.#isUnique(mon)) {
-            reused++;
-            const doc = await fromUuid(existing.uuid);
-            const actor = existing.source === "world" ? doc : await game.actors.importFromCompendium(game.packs.get(existing.source), doc.id);
-            if (actor?.id) occupants.set(normRef(mon.name), { actorId: actor.id });
-            this.#status(`Reusing existing monster: ${mon.name} (${existing.source})`, 0.60 + 0.12 * (i / converted.monsters.length));
-            continue;
+      // ---------- 4. Actors ----------
+      if (runStage("actors")) {
+        const builder = await new ActorBuilder().prepare();
+        const monsterIndex = await new MonsterIndex().build();
+        let i = 0, failed = 0;
+        for (const npc of converted.npcs) {
+          this.#status(`Creating NPC ${++i}/${converted.npcs.length}: ${npc.name}`, 0.45 + 0.15 * (i / Math.max(1, converted.npcs.length)));
+          try {
+            const actor = await builder.buildActor(npc, { folderId: folders.npcs.id });
+            if (!actor?.id) throw new Error("Actor.create returned no document");
+            if (npc.locationRef) occupants.set(normRef(npc.locationRef) + "|" + normRef(npc.name), { actorId: actor.id });
+            occupants.set(normRef(npc.name), { actorId: actor.id });
+          } catch (e) {
+            failed++;
+            warn(`NPC "${npc.name}" failed; skipping`, e);
+            this.#status(`⚠ NPC "${npc.name}" failed (${e.message}) — skipped. See AI Call Inspector.`);
           }
-          this.#status(`Creating monster ${i}/${converted.monsters.length}: ${mon.name}`, 0.60 + 0.12 * (i / converted.monsters.length));
-          const actor = await builder.buildActor(mon, { folderId: folders.monsters.id });
-          if (!actor?.id) throw new Error("Actor.create returned no document");
-          monsterIndex.register(mon.name, actor.uuid);
-          occupants.set(normRef(mon.name), { actorId: actor.id });
-        } catch (e) {
-          failed++;
-          warn(`Monster "${mon.name}" failed; skipping`, e);
-          this.#status(`⚠ Monster "${mon.name}" failed (${e.message}) — skipped. See AI Call Inspector.`);
         }
+
+        i = 0;
+        let reused = 0;
+        for (const mon of converted.monsters) {
+          i++;
+          try {
+            const existing = monsterIndex.find(mon.name);
+            if (existing && !this.#isUnique(mon)) {
+              reused++;
+              const doc = await fromUuid(existing.uuid);
+              const actor = existing.source === "world" ? doc : await game.actors.importFromCompendium(game.packs.get(existing.source), doc.id);
+              if (actor?.id) occupants.set(normRef(mon.name), { actorId: actor.id });
+              this.#status(`Reusing existing monster: ${mon.name} (${existing.source})`, 0.60 + 0.12 * (i / converted.monsters.length));
+              continue;
+            }
+            this.#status(`Creating monster ${i}/${converted.monsters.length}: ${mon.name}`, 0.60 + 0.12 * (i / converted.monsters.length));
+            const actor = await builder.buildActor(mon, { folderId: folders.monsters.id });
+            if (!actor?.id) throw new Error("Actor.create returned no document");
+            monsterIndex.register(mon.name, actor.uuid);
+            occupants.set(normRef(mon.name), { actorId: actor.id });
+          } catch (e) {
+            failed++;
+            warn(`Monster "${mon.name}" failed; skipping`, e);
+            this.#status(`⚠ Monster "${mon.name}" failed (${e.message}) — skipped. See AI Call Inspector.`);
+          }
+        }
+        this.#status(`Actors done (${converted.npcs.length} NPCs, ${converted.monsters.length - reused} new monsters, ${reused} reused${failed ? `, ${failed} skipped` : ""}).`, 0.72);
+      } else {
+        this.#status("Skipping actor creation (stage filter).", 0.72);
       }
-      this.#status(`Actors done (${converted.npcs.length} NPCs, ${converted.monsters.length - reused} new monsters, ${reused} reused${failed ? `, ${failed} skipped` : ""}).`, 0.72);
 
       // ---------- 5. Scenes ----------
-      // Identify what each candidate map plate actually depicts (vision pass)
-      // so plates printed far from their keyed text — covers, appendices —
-      // match by title/key evidence rather than page proximity.
-      let plates = [];
-      try {
-        plates = await identifyMapPlates(pageImages, { onProgress: (m) => this.#status(m) });
-        this.#status(`Identified ${plates.length} map plate(s): ${plates.map((p) => `p${p.page}${p.title ? ` "${p.title}"` : ""}`).join(", ") || "none"}`);
-      } catch (e) {
-        warn("Plate identification unavailable (text-only LLM?); falling back to page proximity", e);
-      }
-
-      const sceneBuilder = new SceneBuilder();
-      const sceneByMap = new Map();
-      const encounterIndex = []; // {parentMap, terrain, scene}
-      const mapGroups = this.#groupLocations(extracted, pages, pageImages, plates);
-      let s = 0;
-      for (const grp of mapGroups) {
-        s++;
-        this.#status(`Building scene ${s}/${mapGroups.length}: ${grp.name}`, 0.72 + 0.2 * (s / mapGroups.length));
+      if (runStage("maps")) {
+        // Identify what each candidate map plate actually depicts (vision pass)
+        // so plates printed far from their keyed text — covers, appendices —
+        // match by title/key evidence rather than page proximity.
+        let plates = [];
         try {
-          const scene = await sceneBuilder.buildScene(grp, occupants, { onProgress: (m) => this.#status(m) });
-          sceneByMap.set(grp.name, scene);
-          // Wilderness hex map → tactical "zoom-in" encounter maps per terrain.
-          if (scene.flags?.["acks-classic-importer"]?.hex) {
-            const layout = scene.flags["acks-classic-importer"].layout;
-            const encs = await sceneBuilder.buildEncounterScenes(grp, layout, {
-              folderId: folders.encounterScenes.id,
-              onProgress: (m) => this.#status(m)
-            });
-            for (const e of encs) encounterIndex.push({ parentMap: grp.name, ...e });
-          }
+          plates = await identifyMapPlates(pageImages, { onProgress: (m) => this.#status(m) });
+          this.#status(`Identified ${plates.length} map plate(s): ${plates.map((p) => `p${p.page}${p.title ? ` "${p.title}"` : ""}`).join(", ") || "none"}`);
         } catch (e) {
-          warn(`Scene failed for ${grp.name}`, e);
-          this.#status(`⚠ Scene failed for ${grp.name}: ${e.message}`);
+          warn("Plate identification unavailable (text-only LLM?); falling back to page proximity", e);
         }
-      }
 
-      // GM quick-reference: terrain → encounter scene links, next to the
-      // random-encounter tables it will be used with.
-      if (encounterIndex.length) {
-        const byTerrain = new Map();
-        for (const e of encounterIndex) {
-          if (!byTerrain.has(e.terrain)) byTerrain.set(e.terrain, []);
-          byTerrain.get(e.terrain).push(e);
+        const sceneBuilder = new SceneBuilder();
+        const encounterIndex = []; // {parentMap, terrain, scene}
+        const mapGroups = this.#groupLocations(extracted, pages, pageImages, plates);
+
+        // Identified plates that no keyed-location group claimed still deserve
+        // their own scene — e.g. an overland/wilderness map with no keyed rooms,
+        // or a dungeon plate whose keys never matched a group. Otherwise the
+        // plate is identified and then silently dropped (and a wilderness plate
+        // would never trigger its per-terrain encounter maps).
+        const claimedPages = new Set(mapGroups.map((g) => g.plateMeta?.page).filter((p) => p != null));
+        for (const plate of plates) {
+          if (claimedPages.has(plate.page)) continue;
+          mapGroups.push({
+            name: plate.title || `Map — page ${plate.page}`,
+            locations: [], pagesUsed: new Set([plate.page]), sourceText: "",
+            mapPlateDataUrl: plate.dataUrl, plateMeta: plate, describedOnly: false
+          });
         }
-        const rows = [...byTerrain.entries()].map(([terrain, list]) =>
-          `<tr><th>${terrain}</th><td>${list.map((e) => `@UUID[Scene.${e.scene.id}]{${e.scene.name}}`).join(" &nbsp; ")}</td></tr>`
-        ).join("");
-        await JournalEntry.create({
-          name: `Wilderness Encounters — ${moduleName}`,
-          folder: folders.journals.id,
-          pages: [{
-            name: "Tactical maps by terrain",
-            type: "text",
-            text: {
-              format: CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML,
-              content: `<p>When a random encounter fires on the wilderness map, activate the matching terrain scene below and drop the rolled monsters in. Tree clusters limit sight but not movement; boulders and outcrops block both; cliff lines block movement only.</p><table>${rows}</table>`
+
+        let s = 0;
+        for (const grp of mapGroups) {
+          s++;
+          this.#status(`Building scene ${s}/${mapGroups.length}: ${grp.name}`, 0.72 + 0.2 * (s / mapGroups.length));
+          try {
+            const scene = await sceneBuilder.buildScene(grp, occupants, { onProgress: (m) => this.#status(m) });
+            if (!scene) continue; // no image provider → map skipped
+            sceneByMap.set(grp.name, scene);
+            // Wilderness (outdoor hex) map → tactical "zoom-in" encounter maps per terrain.
+            if (scene.flags?.["acks-classic-importer"]?.hex) {
+              const encs = await sceneBuilder.buildEncounterScenes(grp, {
+                folderId: folders.encounterScenes.id,
+                onProgress: (m) => this.#status(m)
+              });
+              for (const e of encs) encounterIndex.push({ parentMap: grp.name, ...e });
             }
-          }]
-        });
-        this.#status(`Created ${encounterIndex.length} tactical encounter map(s) across ${byTerrain.size} terrain type(s).`);
+          } catch (e) {
+            warn(`Scene failed for ${grp.name}`, e);
+            this.#status(`⚠ Scene failed for ${grp.name}: ${e.message}`);
+          }
+        }
+
+        // GM quick-reference: terrain → encounter scene links, next to the
+        // random-encounter tables it will be used with.
+        if (encounterIndex.length) {
+          const byTerrain = new Map();
+          for (const e of encounterIndex) {
+            if (!byTerrain.has(e.terrain)) byTerrain.set(e.terrain, []);
+            byTerrain.get(e.terrain).push(e);
+          }
+          const rows = [...byTerrain.entries()].map(([terrain, list]) =>
+            `<tr><th>${terrain}</th><td>${list.map((e) => `@UUID[Scene.${e.scene.id}]{${e.scene.name}}`).join(" &nbsp; ")}</td></tr>`
+          ).join("");
+          await JournalEntry.create({
+            name: `Wilderness Encounters — ${moduleName}`,
+            folder: folders.journals.id,
+            pages: [{
+              name: "Tactical maps by terrain",
+              type: "text",
+              text: {
+                format: CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML,
+                content: `<p>When a random encounter fires on the wilderness map, activate the matching terrain scene below and drop the rolled monsters in.</p><table>${rows}</table>`
+              }
+            }]
+          });
+          this.#status(`Created ${encounterIndex.length} tactical encounter map(s) across ${byTerrain.size} terrain type(s).`);
+        }
+      } else {
+        this.#status("Skipping map generation (stage filter).", 0.92);
       }
 
       // ---------- 6. Journals & tables ----------
-      this.#status("Creating journals and roll tables…", 0.95);
-      await buildJournals(extracted, sceneByMap, folders.journals.id);
-      await buildRollTables(extracted, folders.tables.id);
+      if (runStage("journals")) {
+        this.#status("Creating journals and roll tables…", 0.95);
+        await buildJournals(extracted, sceneByMap, folders.journals.id);
+        await buildRollTables(extracted, folders.tables.id);
+      }
 
       this.state.stage = "done";
       this.#status(`Import complete: ${moduleName}. Review actors and scenes in their "${moduleName}" folders.`, 1);

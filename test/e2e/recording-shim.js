@@ -15,6 +15,15 @@
  */
 
 import { createCanvas, Image as NapiImage, loadImage } from "@napi-rs/canvas";
+import { setGlobalDispatcher, Agent } from "undici";
+
+// Node's fetch (undici) caps "time to response headers" and "time between body
+// chunks" at ~300s by default, INDEPENDENT of any AbortSignal. A non-streaming
+// LLM call to a slow local reasoning model sends nothing until generation
+// finishes, so that cap can fire mid-call. Disable both here (0 = no limit) so
+// the LLMClient's own configurable AbortSignal timeout (default 600s, min 5
+// min) is the single governing ceiling for the e2e harness.
+setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }));
 
 export const REC = {
   actors: [], scenes: [], journals: [], tables: [], folders: [],

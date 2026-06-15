@@ -6,15 +6,21 @@
  */
 
 import { createCanvas } from "@napi-rs/canvas";
+import { isLikelyMapPage } from "../../scripts/pipeline/pdf-extractor.js";
 
-export async function extractPdfNode(path, { renderScale = 1.5, maxPages = Infinity } = {}) {
+export async function extractPdfNode(path, { renderScale = 1.5, maxPages = Infinity, pageSet = null } = {}) {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const data = new Uint8Array((await import("node:fs")).readFileSync(path));
   const doc = await pdfjs.getDocument({ data, useSystemFonts: true }).promise;
 
   const pages = [], pageImages = [];
-  const n = Math.min(doc.numPages, maxPages);
-  for (let i = 1; i <= n; i++) {
+  // Either an explicit set of page numbers (preserving their real page indices)
+  // or the first `maxPages` pages. Real page numbers are kept either way so
+  // sourcePages / plate.page references downstream stay correct.
+  const wanted = pageSet
+    ? [...pageSet].filter((p) => p >= 1 && p <= doc.numPages).sort((a, b) => a - b)
+    : Array.from({ length: Math.min(doc.numPages, maxPages) }, (_, k) => k + 1);
+  for (const i of wanted) {
     const page = await doc.getPage(i);
 
     // text
@@ -36,7 +42,7 @@ export async function extractPdfNode(path, { renderScale = 1.5, maxPages = Infin
     const ctx = canvas.getContext("2d");
     await page.render({ canvasContext: ctx, viewport, canvas }).promise;
     const inkRatio = estimateInk(ctx, canvas.width, canvas.height);
-    const isLikelyMap = text.replace(/\s/g, "").length < 600 && inkRatio > 0.04;
+    const isLikelyMap = isLikelyMapPage(text, inkRatio);
     pageImages.push({ page: i, dataUrl: canvas.toDataURL("image/png"), isLikelyMap, inkRatio });
   }
   return { pages, pageImages, numPages: doc.numPages };

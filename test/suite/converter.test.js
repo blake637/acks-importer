@@ -26,9 +26,9 @@ describe("hit dice parsing", () => {
   it("plain '7' → 7", () => expect(parseHD("7").effective).toBe(7));
 });
 
-describe("saves derive from HD (fighter table)", () => {
+describe("saves derive from HD (fighter progression)", () => {
   it("1 HD death save 14", () => expect(savesForHD(1).death).toBe(14));
-  it("clamps HD > 14", () => expect(savesForHD(30).death).toBe(savesForHD(14).death));
+  it("keeps improving past HD 14 (uncapped)", () => expect(savesForHD(30).death).toBeLessThan(savesForHD(14).death));
   it("0 HD has a save row", () => expect(savesForHD(0.5).paralysis).toBeGreaterThan(0));
 });
 

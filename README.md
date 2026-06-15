@@ -1,7 +1,7 @@
 # ACKS Classic Module Importer (Foundry VTT)
 
 Imports classic TSR-era adventure module PDFs — Basic/Expert, AD&D 1e, AD&D 2e —
-and generates a playable Foundry world for the **Adventurer Conqueror King
+as well as mmodern 5e adventure PDFs and generates a playable Foundry world for the **Adventurer Conqueror King
 System (ACKS)**:
 
 - **Actors** for every NPC and monster, with stats converted to ACKS, embedded

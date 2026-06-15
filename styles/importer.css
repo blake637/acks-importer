@@ -38,6 +38,8 @@
 .aci-call-body pre.aci-error { color: #a22; }
 .aci-call-body h4 { margin: 6px 0 2px; }
 img.aci-thumb { border: 1px solid rgba(0,0,0,0.3); border-radius: 4px; max-width: 160px; }
+.aci-inputs { display: flex; flex-wrap: wrap; gap: 6px; }
+.aci-inputs img.aci-thumb { max-width: 320px; max-height: 320px; }
 
 textarea.aci-fix { resize: vertical; }
 .aci-hint { background: rgba(180,120,30,0.15); border-left: 3px solid #b07b34; padding: 6px 10px; border-radius: 3px; font-size: 0.9em; }
